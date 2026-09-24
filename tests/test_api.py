@@ -153,3 +153,155 @@ def test_validation_errors():
 def test_unknown_measure_returns_404():
     assert client.get("/measures/999999").status_code == 404
     assert client.get("/measures/999999/grid").status_code == 404
+
+
+# --- POST /loop-alignments -------------------------------------------------
+
+# Loop B: length 3/2 (target 3/2), "bass" rests all the way through.
+LONG_LOOP_PAYLOAD = {
+    "target_duration": "3/2",
+    "voices": [
+        {
+            "name": "melody",
+            "events": [
+                {"kind": "sound", "duration": "1/2"},
+                {"kind": "rest", "duration": "1"},
+            ],
+        },
+        {
+            "name": "bass",
+            "events": [{"kind": "rest", "duration": "3/2"}],
+        },
+    ],
+}
+
+
+def test_loop_alignment_realigns_two_different_length_loops():
+    a_id = client.post("/measures", json=VALID_PAYLOAD).json()["id"]
+    b_id = client.post("/measures", json=LONG_LOOP_PAYLOAD).json()["id"]
+    response = client.post(
+        "/loop-alignments", json={"a_measure_id": a_id, "b_measure_id": b_id}
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+
+    # lcm(1, 3/2) = 3: A repeats 3 times, B twice.
+    assert body["horizon"] == "3"
+    assert body["length_a"] == "1"
+    assert body["length_b"] == "3/2"
+    assert body["repetitions"] == {"a": 3, "b": 2}
+    assert body["voices"] == {"a": ["melody", "bass"], "b": ["melody", "bass"]}
+    # 5 A events per loop * 3 + 3 B events per loop * 2 = 21 copies.
+    assert body["expanded_events"] == 21
+
+    segments = body["segments"]
+    assert segments[0]["start"] == "0"
+    assert segments[-1]["end"] == "3"
+    for left, right in zip(segments, segments[1:]):
+        assert left["end"] == right["start"]
+
+    # First segment: both loops in their first iteration.
+    first = segments[0]
+    assert first["start"] == "0"
+    assert first["end"] == "1/4"
+    assert first["a"] == {
+        "melody": {"event_id": "v1e1", "loop": 1},
+        "bass": None,
+    }
+    assert first["b"] == {
+        "melody": {"event_id": "v1e1", "loop": 1},
+        "bass": None,
+    }
+
+    # At t = 3/2 both loops restart together (A for the 2nd time, B too).
+    # A's melody pattern rests for its first quarter-offset there, so the
+    # half-open segment starting at 3/2 shows A resting while B's long
+    # opening sound is tagged with loop 2.
+    joint = next(segment for segment in segments if segment["start"] == "3/2")
+    assert joint["a"]["melody"] is None
+    assert joint["b"]["melody"] == {"event_id": "v1e1", "loop": 2}
+
+    # A quarter later both are still in their second loops: A's final
+    # event of the pattern, B still inside its opening half-unit sound.
+    later = next(segment for segment in segments if segment["start"] == "7/4")
+    assert later["end"] == "2"
+    assert later["a"]["melody"] == {"event_id": "v1e3", "loop": 2}
+    assert later["b"]["melody"] == {"event_id": "v1e1", "loop": 2}
+
+    # The final segment [11/4, 3) is A's third loop while B is still in
+    # its second; after it both are back at the start simultaneously.
+    assert segments[-1]["start"] == "11/4"
+    assert segments[-1]["end"] == "3"
+    assert segments[-1]["a"]["melody"] == {"event_id": "v1e3", "loop": 3}
+    assert segments[-1]["b"]["melody"] is None
+
+
+def test_loop_alignment_accepts_same_measure_for_a_and_b():
+    measure_id = client.post("/measures", json=VALID_PAYLOAD).json()["id"]
+    response = client.post(
+        "/loop-alignments",
+        json={"a_measure_id": measure_id, "b_measure_id": measure_id},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["horizon"] == "1"
+    assert body["repetitions"] == {"a": 1, "b": 1}
+    # Same grid as the single measure, duplicated under a and b.
+    assert [(s["start"], s["end"]) for s in body["segments"]] == [
+        ("0", "1/4"),
+        ("1/4", "1/2"),
+        ("1/2", "3/4"),
+        ("3/4", "1"),
+    ]
+    assert body["segments"][0]["a"] == body["segments"][0]["b"]
+
+
+def test_loop_alignment_missing_measure_returns_404():
+    measure_id = client.post("/measures", json=VALID_PAYLOAD).json()["id"]
+    response = client.post(
+        "/loop-alignments",
+        json={"a_measure_id": measure_id, "b_measure_id": 999999},
+    )
+    assert response.status_code == 404
+    assert "b" in response.json()["detail"]
+
+    response = client.post(
+        "/loop-alignments",
+        json={"a_measure_id": 999998, "b_measure_id": 999999},
+    )
+    assert response.status_code == 404
+    assert "segments" not in response.text
+
+
+def test_loop_alignment_over_expansion_limit_returns_422_without_timeline():
+    # One event per voice, two voices, length 1/1000: each loop repeats
+    # 1000 times against a length-1 loop -> 4000 > 2000 copies.
+    tiny = {
+        "target_duration": "1/1000",
+        "voices": [
+            {"name": "a", "events": [{"kind": "sound", "duration": "1/1000"}]},
+            {"name": "b", "events": [{"kind": "rest", "duration": "1/1000"}]},
+        ],
+    }
+    one = {
+        "target_duration": "1",
+        "voices": [
+            {"name": "a", "events": [{"kind": "sound", "duration": "1"}]},
+            {"name": "b", "events": [{"kind": "rest", "duration": "1"}]},
+        ],
+    }
+    tiny_id = client.post("/measures", json=tiny).json()["id"]
+    one_id = client.post("/measures", json=one).json()["id"]
+    response = client.post(
+        "/loop-alignments",
+        json={"a_measure_id": tiny_id, "b_measure_id": one_id},
+    )
+    assert response.status_code == 422, response.text
+    detail = response.json()["detail"]
+    assert detail["expanded_events"] == 2 * 1000 + 2
+    assert detail["limit"] == 2000
+    assert detail["horizon"] == "1"
+    assert detail["repetitions"] == {"a": 1000, "b": 1}
+    # No truncated timeline is output.
+    assert "segments" not in detail
+    assert "segments" not in response.text

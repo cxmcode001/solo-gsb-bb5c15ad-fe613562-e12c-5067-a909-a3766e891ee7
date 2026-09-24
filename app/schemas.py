@@ -96,3 +96,40 @@ class GridOut(BaseModel):
     target_duration: str
     voices: list[str]
     segments: list[SegmentOut]
+
+
+class LoopAlignmentIn(BaseModel):
+    """Two saved measure ids looped together; either id may repeat."""
+
+    a_measure_id: int = Field(examples=[1])
+    b_measure_id: int = Field(examples=[2])
+
+
+class ActiveLoopEvent(BaseModel):
+    """A sounding event at some point of the repeated timeline."""
+
+    event_id: str
+    loop: int
+
+
+class AlignmentSegmentOut(BaseModel):
+    """Half-open segment [start, end); null means the voice rests."""
+
+    start: str
+    end: str
+    a: dict[str, ActiveLoopEvent | None]
+    b: dict[str, ActiveLoopEvent | None]
+
+
+class LoopAlignmentOut(BaseModel):
+    a_measure_id: int
+    b_measure_id: int
+    # First instant both loops restart together.
+    horizon: str
+    # Loop lengths and 1-based repetition counts reaching the horizon.
+    length_a: str
+    length_b: str
+    repetitions: dict[str, int]
+    voices: dict[str, list[str]]
+    expanded_events: int
+    segments: list[AlignmentSegmentOut]

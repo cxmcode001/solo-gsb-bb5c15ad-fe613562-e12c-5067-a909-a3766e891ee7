@@ -91,6 +91,61 @@ curl -s -X POST http://localhost:8000/measures \
 }
 ```
 
+### `POST /loop-alignments` — 两小节循环对齐（排练用）
+
+接收两个**已保存小节**的 ID（同一小节可同时作为 A、B），把它们当作两条不同长度的
+节奏循环，用精确分数求两条循环**首次同时回到起点**的时刻（两小节时长的最小公倍数），
+并把两条循环的事件分别重复到该时刻。时间线按两条循环**全部事件边界**的并集切成
+半开区间；每段分别在 `a` / `b` 下按各声部给出正在发声事件的**原事件 ID** 和
+**从 1 开始的循环序号**，休止为 `null`。
+
+- 任一小节 ID 不存在返回 **404**（detail 指明是 `a` 还是 `b`），不产生时间线。
+- 展开的事件副本总数（= A 重复次数 × A 事件数 + B 重复次数 × B 事件数）超过
+  **2000** 时返回 **422**，detail 给出 `expanded_events` / `limit` / `horizon` /
+  `repetitions` 等信息，**不输出任何截断的时间线**（响应中没有 `segments`）。
+
+```bash
+curl -s -X POST http://localhost:8000/loop-alignments \
+  -H 'Content-Type: application/json' \
+  -d '{"a_measure_id": 1, "b_measure_id": 2}'
+```
+
+例：A 小节时长 `1`、B 小节时长 `3/2`，首次重合在 `3`（A 重复 3 次、B 重复 2 次）：
+
+```json
+{
+  "a_measure_id": 1,
+  "b_measure_id": 2,
+  "horizon": "3",
+  "length_a": "1",
+  "length_b": "3/2",
+  "repetitions": {"a": 3, "b": 2},
+  "voices": {"a": ["melody", "bass"], "b": ["melody", "bass"]},
+  "expanded_events": 21,
+  "segments": [
+    {
+      "start": "0",
+      "end": "1/4",
+      "a": {"melody": {"event_id": "v1e1", "loop": 1}, "bass": null},
+      "b": {"melody": {"event_id": "v1e1", "loop": 1}, "bass": null}
+    },
+    {
+      "start": "1",
+      "end": "5/4",
+      "a": {"melody": {"event_id": "v1e1", "loop": 2}, "bass": null},
+      "b": {"melody": null, "bass": null}
+    }
+  ]
+}
+```
+
+`event_id` 是事件在**原小节**中的 ID（如 `v1e1`，与 `GET /measures/{id}` 返回的一致）；
+`loop` 表示该发声来自第几次循环。半开区间 `[start, end)` 保证循环边界处既不丢音也不
+重复计音：恰好在某次循环起点休止的声部，在该起点的段中为 `null`。
+
+> 在浏览器中打开 http://localhost:8000/ 可查看服务与接口清单，
+> http://localhost:8000/docs 为可直接发起请求的 Swagger UI。
+
 ## 本地开发与测试
 
 ```bash
@@ -104,7 +159,7 @@ python3 -m unittest discover -s tests -p 'test_grid.py'   # 仅核心逻辑（�
 
 ```
 app/
-  grid.py      # 核心逻辑：有理数解析、精确累加、边界并集切分网格（纯标准库）
+  grid.py      # 核心逻辑：有理数解析、精确累加、边界并集切分网格、循环对齐（纯标准库）
   db.py        # SQLite 连接、建表、读写（纯标准库）
   schemas.py   # Pydantic 请求/响应模型与校验
   main.py      # FastAPI 应用与路由（启动时初始化数据库）

@@ -10,6 +10,7 @@ from __future__ import annotations
 import re
 from bisect import bisect_right
 from fractions import Fraction
+from math import gcd, lcm
 
 # A positive rational: "3", "3/4", "12/8" ... (no sign, no decimals).
 _RATIONAL_RE = re.compile(r"^(\d+)(?:/(\d+))?$")
@@ -17,6 +18,10 @@ _RATIONAL_RE = re.compile(r"^(\d+)(?:/(\d+))?$")
 KIND_SOUND = "sound"
 KIND_REST = "rest"
 KINDS = (KIND_SOUND, KIND_REST)
+
+# Safety cap on the number of repeated event copies an alignment may
+# expand to; over this the request is rejected and no timeline is built.
+MAX_EXPANDED_EVENTS = 2000
 
 
 def parse_rational(text: str) -> Fraction:
@@ -123,3 +128,142 @@ def compute_grid(voices: list[dict]) -> list[dict]:
             )
         segments.append({"start": start, "end": end, "events": active})
     return segments
+
+
+def rational_lcm(left: Fraction, right: Fraction) -> Fraction:
+    """Least positive common multiple of two positive rationals.
+
+    This is the first instant t > 0 at which two loops of lengths
+    ``left`` and ``right`` are simultaneously back at their start:
+    t = k * left = m * right for positive integers k, m.
+    """
+    return Fraction(
+        lcm(left.numerator, right.numerator),
+        gcd(left.denominator, right.denominator),
+    )
+
+
+class LoopAlignmentTooLarge(Exception):
+    """Expansion would produce more than ``max_events`` event copies."""
+
+    def __init__(
+        self,
+        *,
+        horizon: Fraction,
+        repetitions_a: int,
+        repetitions_b: int,
+        event_count_a: int,
+        event_count_b: int,
+        expanded_events: int,
+        max_events: int,
+    ) -> None:
+        super().__init__(
+            f"loop alignment expands to {expanded_events} events, "
+            f"over the limit of {max_events}"
+        )
+        self.horizon = horizon
+        self.repetitions_a = repetitions_a
+        self.repetitions_b = repetitions_b
+        self.event_count_a = event_count_a
+        self.event_count_b = event_count_b
+        self.expanded_events = expanded_events
+        self.max_events = max_events
+
+
+def align_loops(
+    length_a: Fraction,
+    voices_a: list[dict],
+    length_b: Fraction,
+    voices_b: list[dict],
+    *,
+    max_events: int = MAX_EXPANDED_EVENTS,
+) -> dict:
+    """Align two looping measures at their first common restart.
+
+    Each measure is treated as a loop repeated from t = 0. The horizon
+    is the first positive instant at which both loops restart together
+    (the rational LCM of their lengths); events are repeated to cover
+    [0, horizon). The timeline is cut into half-open segments by the
+    union of every repeated event boundary. Per segment, every voice is
+    tagged with the original event id and its 1-based loop number, or
+    null while that voice rests.
+
+    ``voices`` items are {"name": str, "events": [built events]} and
+    each voice must span exactly its loop length. Raises
+    LoopAlignmentTooLarge when the total number of repeated event copies
+    (before any timeline is built) exceeds ``max_events``.
+    """
+    horizon = rational_lcm(length_a, length_b)
+    reps_a = horizon // length_a
+    reps_b = horizon // length_b
+
+    def event_count(voices: list[dict]) -> int:
+        return sum(len(voice["events"]) for voice in voices)
+
+    count_a = event_count(voices_a)
+    count_b = event_count(voices_b)
+    expanded = reps_a * count_a + reps_b * count_b
+    if expanded > max_events:
+        raise LoopAlignmentTooLarge(
+            horizon=horizon,
+            repetitions_a=reps_a,
+            repetitions_b=reps_b,
+            event_count_a=count_a,
+            event_count_b=count_b,
+            expanded_events=expanded,
+            max_events=max_events,
+        )
+
+    # Union of all repeated event boundaries. For loop r (0-based) and a
+    # base measure boundary p the absolute time is r * length + p.
+    points: set[Fraction] = set()
+    for repetition in range(reps_a):
+        origin = repetition * length_a
+        for voice in voices_a:
+            for event in voice["events"]:
+                points.add(origin + event["start"])
+                points.add(origin + event["end"])
+    for repetition in range(reps_b):
+        origin = repetition * length_b
+        for voice in voices_b:
+            for event in voice["events"]:
+                points.add(origin + event["start"])
+                points.add(origin + event["end"])
+    ordered = sorted(points)
+
+    def active_voices(length: Fraction, voices: list[dict], time: Fraction) -> dict:
+        # time is a boundary strictly below horizon, hence it falls in
+        # exactly one half-open event copy per voice.
+        repetition = time // length
+        offset = time - repetition * length
+        result: dict[str, dict] = {}
+        for voice in voices:
+            ends = [event["end"] for event in voice["events"]]
+            event = voice["events"][bisect_right(ends, offset)]
+            # The boundary lies inside this event by construction.
+            assert event["start"] <= offset < event["end"]
+            result[voice["name"]] = (
+                {"event_id": event["id"], "loop": repetition + 1}
+                if event["kind"] == KIND_SOUND
+                else None
+            )
+        return result
+
+    segments = []
+    for index in range(len(ordered) - 1):
+        start, end = ordered[index], ordered[index + 1]
+        segments.append(
+            {
+                "start": start,
+                "end": end,
+                "a": active_voices(length_a, voices_a, start),
+                "b": active_voices(length_b, voices_b, start),
+            }
+        )
+
+    return {
+        "horizon": horizon,
+        "repetitions": {"a": reps_a, "b": reps_b},
+        "expanded_events": expanded,
+        "segments": segments,
+    }

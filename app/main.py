@@ -6,6 +6,11 @@ fractions; a voice that does not fill the target exactly is reported
 with its difference and nothing is saved. Valid measures are stored in
 SQLite and their beat grid — half-open segments over the union of all
 event boundaries — can be queried by id.
+
+Two saved measures can also be looped together (POST /loop-alignments):
+the service computes the first instant both loops restart together and
+returns the repeated timeline cut at every event boundary, tagged with
+each sounding event's original id and its 1-based loop number.
 """
 
 from __future__ import annotations
@@ -17,13 +22,23 @@ from fastapi import FastAPI, HTTPException
 
 from . import db
 from .grid import (
+    MAX_EXPANDED_EVENTS,
+    LoopAlignmentTooLarge,
+    align_loops,
     build_voice_events,
     compute_grid,
     format_rational,
     parse_rational,
     voice_total,
 )
-from .schemas import GridOut, MeasureIn, MeasureOut, Mismatch
+from .schemas import (
+    GridOut,
+    LoopAlignmentIn,
+    LoopAlignmentOut,
+    MeasureIn,
+    MeasureOut,
+    Mismatch,
+)
 
 
 @asynccontextmanager
@@ -50,6 +65,7 @@ def root() -> dict:
             "create_measure": "POST /measures",
             "get_measure": "GET /measures/{id}",
             "get_grid": "GET /measures/{id}/grid",
+            "loop_alignments": "POST /loop-alignments",
         },
     }
 
@@ -104,13 +120,9 @@ def get_measure(measure_id: int) -> dict:
     return measure
 
 
-@app.get("/measures/{measure_id}/grid", response_model=GridOut)
-def get_grid(measure_id: int) -> dict:
-    measure = db.load_measure(measure_id)
-    if measure is None:
-        raise HTTPException(status_code=404, detail="measure not found")
-
-    # Rebuild exact Fraction offsets from the stored canonical strings.
+def _fraction_voices(measure: dict) -> tuple[Fraction, list[dict]]:
+    """Rebuild exact Fraction offsets of a stored measure's events."""
+    length = Fraction(measure["target_duration"])
     voices = []
     for voice in measure["voices"]:
         events = [
@@ -124,7 +136,16 @@ def get_grid(measure_id: int) -> dict:
             for event in voice["events"]
         ]
         voices.append({"name": voice["name"], "events": events})
+    return length, voices
 
+
+@app.get("/measures/{measure_id}/grid", response_model=GridOut)
+def get_grid(measure_id: int) -> dict:
+    measure = db.load_measure(measure_id)
+    if measure is None:
+        raise HTTPException(status_code=404, detail="measure not found")
+
+    _, voices = _fraction_voices(measure)
     segments = compute_grid(voices)
     return {
         "measure_id": measure["id"],
@@ -137,5 +158,78 @@ def get_grid(measure_id: int) -> dict:
                 "events": segment["events"],
             }
             for segment in segments
+        ],
+    }
+
+
+@app.post("/loop-alignments", response_model=LoopAlignmentOut)
+def loop_alignments(payload: LoopAlignmentIn) -> dict:
+    # Either id may be missing (they may also be identical); report
+    # which one, and never fabricate a timeline.
+    measure_a = db.load_measure(payload.a_measure_id)
+    measure_b = db.load_measure(payload.b_measure_id)
+    missing = [
+        label
+        for label, measure in (("a", measure_a), ("b", measure_b))
+        if measure is None
+    ]
+    if missing:
+        raise HTTPException(
+            status_code=404,
+            detail=f"measure not found: {' and '.join(missing)}",
+        )
+    assert measure_a is not None and measure_b is not None
+
+    length_a, voices_a = _fraction_voices(measure_a)
+    length_b, voices_b = _fraction_voices(measure_b)
+
+    try:
+        result = align_loops(
+            length_a,
+            voices_a,
+            length_b,
+            voices_b,
+            max_events=MAX_EXPANDED_EVENTS,
+        )
+    except LoopAlignmentTooLarge as exc:
+        # Rejected before any timeline is built: no segments output.
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "loop alignment expands to too many events; "
+                "no timeline produced",
+                "expanded_events": exc.expanded_events,
+                "limit": exc.max_events,
+                "a_measure_id": payload.a_measure_id,
+                "b_measure_id": payload.b_measure_id,
+                "horizon": format_rational(exc.horizon),
+                "repetitions": {"a": exc.repetitions_a, "b": exc.repetitions_b},
+                "event_counts": {
+                    "a": exc.event_count_a,
+                    "b": exc.event_count_b,
+                },
+            },
+        ) from exc
+
+    return {
+        "a_measure_id": measure_a["id"],
+        "b_measure_id": measure_b["id"],
+        "horizon": format_rational(result["horizon"]),
+        "length_a": format_rational(length_a),
+        "length_b": format_rational(length_b),
+        "repetitions": result["repetitions"],
+        "voices": {
+            "a": [voice["name"] for voice in voices_a],
+            "b": [voice["name"] for voice in voices_b],
+        },
+        "expanded_events": result["expanded_events"],
+        "segments": [
+            {
+                "start": format_rational(segment["start"]),
+                "end": format_rational(segment["end"]),
+                "a": segment["a"],
+                "b": segment["b"],
+            }
+            for segment in result["segments"]
         ],
     }
