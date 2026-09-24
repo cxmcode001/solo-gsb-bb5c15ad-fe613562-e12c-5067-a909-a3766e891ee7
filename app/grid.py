@@ -10,6 +10,7 @@ from __future__ import annotations
 import re
 from bisect import bisect_right
 from fractions import Fraction
+from math import gcd, lcm
 
 # A positive rational: "3", "3/4", "12/8" ... (no sign, no decimals).
 _RATIONAL_RE = re.compile(r"^(\d+)(?:/(\d+))?$")
@@ -83,6 +84,94 @@ def voice_total(events: list[dict]) -> Fraction:
     for event in events:
         total += event["duration"]
     return total
+
+
+def lcm_rational(a: Fraction, b: Fraction) -> Fraction:
+    """Least positive common multiple of two positive rationals.
+
+    The smallest t > 0 with t/a and t/b both integral: the first time
+    two loops of lengths a and b simultaneously return to their start.
+    LCM(p/q, r/s) = lcm(p, r) / gcd(q, s).
+    """
+    return Fraction(lcm(a.numerator, b.numerator), gcd(a.denominator, b.denominator))
+
+
+def repeat_events(
+    voices: list[dict], length: Fraction, cycles: int
+) -> list[dict]:
+    """Tile a measure's events forward over [0, cycles * length).
+
+    Each repeated copy keeps the original event's id and additionally
+    carries the 1-based loop index it belongs to. Events stay half-open:
+    the copy in loop k spans [start + (k - 1) * length, end + (k - 1) *
+    length), so the boundary at a loop restart belongs to the next copy.
+    """
+    repeated = []
+    for voice in voices:
+        copies = []
+        for loop_index in range(1, cycles + 1):
+            offset = length * (loop_index - 1)
+            for event in voice["events"]:
+                copies.append(
+                    {
+                        "id": event["id"],
+                        "kind": event["kind"],
+                        "start": event["start"] + offset,
+                        "end": event["end"] + offset,
+                        "loop": loop_index,
+                    }
+                )
+        repeated.append({"name": voice["name"], "events": copies})
+    return repeated
+
+
+def compute_loop_grid(sides: list[tuple[str, list[dict]]], horizon: Fraction) -> list[dict]:
+    """Segment [0, horizon) by the union of every event boundary.
+
+    ``sides`` is an ordered list of (side_key, tracks), e.g.
+    [("a", ...), ("b", ...)]; each track is {"name", "events"} (as
+    produced by :func:`repeat_events`) covering [0, horizon). Namespacing
+    per side is required because a measure can be aligned with itself,
+    so voice names recur across sides.
+
+    Returns segments [start, end) mapping each side to a per-voice map
+    of [event_id, loop_index] for a sounding event, or None for a rest.
+    Like :func:`compute_grid`, half-open intervals make every boundary
+    belong to exactly one event per voice.
+    """
+    points: set[Fraction] = {Fraction(0), horizon}
+    ends_per_side = []
+    for _side_key, tracks in sides:
+        ends_per_track = []
+        for track in tracks:
+            ends = []
+            for event in track["events"]:
+                points.add(event["start"])
+                points.add(event["end"])
+                ends.append(event["end"])
+            ends_per_track.append(ends)
+        ends_per_side.append(ends_per_track)
+    ordered = sorted(points)
+
+    segments = []
+    for index in range(len(ordered) - 1):
+        start, end = ordered[index], ordered[index + 1]
+        active: dict[str, dict[str, list | None]] = {}
+        for (side_key, tracks), ends_per_track in zip(sides, ends_per_side):
+            side_active: dict[str, list | None] = {}
+            for track, ends in zip(tracks, ends_per_track):
+                slot = bisect_right(ends, start)
+                event = track["events"][slot]
+                # The segment starts inside this event by construction.
+                assert event["start"] <= start < event["end"]
+                side_active[track["name"]] = (
+                    [event["id"], event["loop"]]
+                    if event["kind"] == KIND_SOUND
+                    else None
+                )
+            active[side_key] = side_active
+        segments.append({"start": start, "end": end, "events": active})
+    return segments
 
 
 def compute_grid(voices: list[dict]) -> list[dict]:

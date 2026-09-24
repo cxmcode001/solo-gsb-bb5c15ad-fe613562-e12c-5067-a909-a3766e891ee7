@@ -12,10 +12,10 @@
 docker compose up --build
 ```
 
-该命令完成依赖安装、SQLite 数据库初始化（应用启动时自动建表）并启动服务。
+启动后访问 **http://localhost:8000**（根路径列出全部接口），
+交互式文档（Swagger UI）在 **http://localhost:8000/docs**。
 
-- API 地址： http://localhost:8000
-- 交互式文档（Swagger UI）： http://localhost:8000/docs
+该命令完成依赖安装、SQLite 数据库初始化（应用启动时自动建表）并启动服务，无需额外步骤。
 
 ## 配置
 
@@ -91,11 +91,60 @@ curl -s -X POST http://localhost:8000/measures \
 }
 ```
 
+### `POST /loop-alignments` — 两段循环排练对齐
+
+传入两个**已保存小节**的 ID（允许相同：同一条小节可同时作为 A、B）。排练时把两小节
+当作不同长度的循环反复播放，接口用精确有理数计算它们**首次同时回到起点**的时刻
+（两个小节时长的最小公倍数 `lcm(len_a, len_b) = lcm(分子) / gcd(分母)`），把各自的
+事件重复展开到该时刻，再按两条循环**全部事件边界的并集**切成半开区间。每段按
+`"a"` / `"b"` 两侧、逐声部给出正在发声事件的**原事件 ID** 与**从 1 开始的循环序号**
+`[id, loop]`，该声部休止为 `null`。半开区间保证重启边界属于新一轮，不丢音、不重复。
+
+```bash
+curl -s -X POST http://localhost:8000/loop-alignments \
+  -H 'Content-Type: application/json' \
+  -d '{"measure_a_id": 1, "measure_b_id": 2}'
+```
+
+例：A 小节时长 `1`（melody/bass），B 小节时长 `3/2`（drum/pad）。首次重合在 `3`：
+A 循环 3 次、B 循环 2 次。
+
+```json
+{
+  "measure_a_id": 1,
+  "measure_b_id": 2,
+  "alignment_time": "3",
+  "loops": {
+    "a": {"measure_id": 1, "target_duration": "1",   "voices": ["melody", "bass"], "loop_count": 3},
+    "b": {"measure_id": 2, "target_duration": "3/2", "voices": ["drum", "pad"],    "loop_count": 2}
+  },
+  "total_event_count": 23,
+  "segments": [
+    {"start": "0",   "end": "1/4", "events": {
+      "a": {"melody": ["v1e1", 1], "bass": null},
+      "b": {"drum": ["v1e1", 1], "pad": ["v2e1", 1]}}},
+    {"start": "1/4", "end": "1/2", "events": {
+      "a": {"melody": ["v1e1", 1], "bass": ["v2e2", 1]},
+      "b": {"drum": null, "pad": ["v2e1", 1]}}}
+  ]
+}
+```
+
+说明：
+
+- 所有时间点（`alignment_time`、各段 `start`/`end`、循环序号）均以 `fractions.Fraction`
+  精确计算，例如长度 `1/3` 与 `1/2` 的首次重合恰为 `1`，无浮点误差。
+- 声部名按 `"a"`/`"b"` 命名空间区分，因此同一条小节对齐自身时不会冲突。
+- 任一小节 ID 不存在返回 **404**。
+- 若把两条循环展开到重合时刻所需的事件总数**超过 2000**，返回 **422**（含
+  `total_event_count`、`limit`、`alignment_time`），且**不输出截断的时间线**；
+  恰好 2000 时正常返回。
+
 ## 本地开发与测试
 
 ```bash
 pip install -r requirements-dev.txt
-uvicorn app.main:app --reload          # 本地启动（默认 ./app.db）
+uvicorn app.main:app --reload          # 本地启动（默认 ./app.db），访问 http://localhost:8000
 pytest                                 # 全部测试（纯逻辑 + API）
 python3 -m unittest discover -s tests -p 'test_grid.py'   # 仅核心逻辑（零依赖）
 ```
@@ -104,7 +153,8 @@ python3 -m unittest discover -s tests -p 'test_grid.py'   # 仅核心逻辑（�
 
 ```
 app/
-  grid.py      # 核心逻辑：有理数解析、精确累加、边界并集切分网格（纯标准库）
+  grid.py      # 核心逻辑：有理数解析、精确累加、边界并集切分网格、
+               #           有理数 LCM 与循环重复展开（纯标准库）
   db.py        # SQLite 连接、建表、读写（纯标准库）
   schemas.py   # Pydantic 请求/响应模型与校验
   main.py      # FastAPI 应用与路由（启动时初始化数据库）

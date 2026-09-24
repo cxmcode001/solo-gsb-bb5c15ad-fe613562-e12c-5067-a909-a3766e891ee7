@@ -96,3 +96,47 @@ class GridOut(BaseModel):
     target_duration: str
     voices: list[str]
     segments: list[SegmentOut]
+
+
+class LoopAlignmentIn(BaseModel):
+    """Two saved measures aligned as repeating loops (may be identical)."""
+
+    measure_a_id: int = Field(gt=0, examples=[1])
+    measure_b_id: int = Field(gt=0, examples=[2])
+
+
+class LoopVoiceOut(BaseModel):
+    """One loop side: measure id, loop length, voices, repetition count."""
+
+    measure_id: int
+    target_duration: str
+    voices: list[str]
+    loop_count: int
+
+
+class LoopAlignmentOut(BaseModel):
+    """Grid over [0, alignment_time) for two repeating loops.
+
+    Each segment maps each loop side ("a"/"b") to a per-voice map:
+    [original event id, 1-based loop index] for a sounding event,
+    or null when that voice rests. Voice names are namespaced under
+    "a"/"b" because the same measure may be aligned with itself.
+    """
+
+    measure_a_id: int
+    measure_b_id: int
+    alignment_time: str
+    loops: dict[str, LoopVoiceOut]
+    total_event_count: int
+    segments: list["LoopSegmentOut"]
+
+
+class LoopSegmentOut(BaseModel):
+    """Half-open segment [start, end) of the aligned loop timeline."""
+
+    start: str
+    end: str
+    events: dict[str, dict[str, list[str | int] | None]]
+
+
+LoopAlignmentOut.model_rebuild()

@@ -8,8 +8,11 @@ from app.grid import (
     KIND_SOUND,
     build_voice_events,
     compute_grid,
+    compute_loop_grid,
     format_rational,
+    lcm_rational,
     parse_rational,
+    repeat_events,
     voice_total,
 )
 
@@ -137,6 +140,93 @@ class GridTest(unittest.TestCase):
         self.assertEqual(segments[0]["events"], {"x": "v1e1", "y": "v2e1"})
         self.assertEqual(segments[1]["events"], {"x": None, "y": "v2e1"})
         self.assertEqual(segments[2]["events"], {"x": None, "y": "v2e2"})
+
+
+class RationalLcmTest(unittest.TestCase):
+    def test_integer_and_fractional_loop_lengths(self):
+        # First simultaneous restart of length-1 and length-3/2 loops.
+        self.assertEqual(lcm_rational(Fraction(1), Fraction(3, 2)), Fraction(3))
+        # lcm(1/2, 1/3) = lcm(1,1)/gcd(2,3) = 1.
+        self.assertEqual(lcm_rational(Fraction(1, 2), Fraction(1, 3)), Fraction(1))
+        # lcm(2/3, 4/5) = lcm(2,4)/gcd(3,5) = 4.
+        self.assertEqual(lcm_rational(Fraction(2, 3), Fraction(4, 5)), Fraction(4))
+        # Equal lengths => the measure itself.
+        self.assertEqual(lcm_rational(Fraction(5, 7), Fraction(5, 7)), Fraction(5, 7))
+
+    def test_result_is_common_multiple_with_integer_cycles(self):
+        a, b = Fraction(3, 4), Fraction(5, 6)
+        t = lcm_rational(a, b)
+        self.assertEqual((t / a).denominator, 1)
+        self.assertEqual((t / b).denominator, 1)
+
+
+class RepeatEventsTest(unittest.TestCase):
+    def test_copies_keep_id_and_carry_loop_index(self):
+        voices = make_voices(
+            [("a", [(KIND_SOUND, "1/2"), (KIND_REST, "1/4")])]
+        )
+        repeated = repeat_events(voices, Fraction(3, 4), 3)
+        copies = repeated[0]["events"]
+        self.assertEqual(len(copies), 6)
+        self.assertEqual(
+            [(c["id"], c["loop"]) for c in copies],
+            [("v1e1", 1), ("v1e2", 1), ("v1e1", 2), ("v1e2", 2), ("v1e1", 3), ("v1e2", 3)],
+        )
+        # Half-open tiling: loop 2 starts exactly where loop 1 ended.
+        self.assertEqual(copies[1]["end"], copies[2]["start"])
+        self.assertEqual(copies[2]["start"], Fraction(3, 4))
+        self.assertEqual(copies[-1]["end"], Fraction(9, 4))
+
+
+class LoopGridTest(unittest.TestCase):
+    def test_two_loops_realignment_grid(self):
+        # A length 1:    sound 1/2, rest 1/2 (repeats 3 times)
+        # B length 3/2:  rest 1/2, sound 1 (repeats 2 times)
+        a = make_voices([("pulse", [(KIND_SOUND, "1/2"), (KIND_REST, "1/2")])])
+        b = make_voices([("pad", [(KIND_REST, "1/2"), (KIND_SOUND, "1")])])
+        horizon = lcm_rational(Fraction(1), Fraction(3, 2))
+        self.assertEqual(horizon, Fraction(3))
+        segments = compute_loop_grid(
+            [("a", repeat_events(a, Fraction(1), 3)),
+             ("b", repeat_events(b, Fraction(3, 2), 2))],
+            horizon,
+        )
+        edges = [(s["start"], s["end"]) for s in segments]
+        self.assertEqual(edges[0], (Fraction(0), Fraction(1, 2)))
+        self.assertEqual(segments[0]["events"], {
+            "a": {"pulse": ["v1e1", 1]},
+            "b": {"pad": None},
+        })
+        # t in [1/2, 1): A loops the second time at t=1; B still in its
+        # first long sound.
+        at_half = next(s for s in segments if s["start"] == Fraction(1, 2))
+        self.assertEqual(at_half["events"]["a"]["pulse"], None)
+        self.assertEqual(at_half["events"]["b"]["pad"], ["v1e2", 1])
+        at_one = next(s for s in segments if s["start"] == Fraction(1))
+        self.assertEqual(at_one["events"]["a"]["pulse"], ["v1e1", 2])
+        self.assertEqual(at_one["events"]["b"]["pad"], ["v1e2", 1])
+        # B restarts at 3/2: half-open, segment starting there is its rest.
+        at_restart = next(s for s in segments if s["start"] == Fraction(3, 2))
+        self.assertEqual(at_restart["events"]["b"]["pad"], None)
+        # Segments tile [0, 3).
+        self.assertEqual(segments[0]["start"], Fraction(0))
+        self.assertEqual(segments[-1]["end"], Fraction(3))
+        for left, right in zip(segments, segments[1:]):
+            self.assertEqual(left["end"], right["start"])
+
+    def test_same_measure_as_both_sides_keeps_voice_namespaces(self):
+        voices = make_voices([("solo", [(KIND_SOUND, "1")])])
+        segments = compute_loop_grid(
+            [("a", repeat_events(voices, Fraction(1), 2)),
+             ("b", repeat_events(voices, Fraction(1), 2))],
+            Fraction(2),
+        )
+        self.assertEqual(len(segments), 2)
+        self.assertEqual(segments[0]["events"], {
+            "a": {"solo": ["v1e1", 1]},
+            "b": {"solo": ["v1e1", 1]},
+        })
+        self.assertEqual(segments[1]["events"]["a"]["solo"], ["v1e1", 2])
 
 
 if __name__ == "__main__":
